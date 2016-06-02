@@ -41,7 +41,9 @@ public final class SystemConfig {
 	private static final String DEFAULT_CHARSET = "utf8";
 
 	private static final String DEFAULT_SQL_PARSER = "druidparser";// fdbparser, druidparser
-	private static final int DEFAULT_BUFFER_CHUNK_SIZE = 4096;
+	private static final short DEFAULT_BUFFER_CHUNK_SIZE = 4096;
+	private static final int DEFAULT_BUFFER_POOL_PAGE_SIZE = 512*1024*4;
+	private static final short DEFAULT_BUFFER_POOL_PAGE_NUMBER = 64;
 	private int processorBufferLocalPercent;
 	private static final int DEFAULT_PROCESSORS = Runtime.getRuntime().availableProcessors();
 	private int frontSocketSoRcvbuf = 1024 * 1024;
@@ -68,6 +70,7 @@ public final class SystemConfig {
 	private int maxStringLiteralLength = 65535;
 	private int frontWriteQueueSize = 2048;
 	private String bindIp = "0.0.0.0";
+	private String fakeMySQLVersion = null;
 	private int serverPort;
 	private int managerPort;
 	private String charset;
@@ -90,14 +93,27 @@ public final class SystemConfig {
 	private int txIsolation;
 	private int parserCommentVersion;
 	private int sqlRecordCount;
-	private long processorBufferPool;
-	private int processorBufferChunk;
+
+	// a page size
+	private int bufferPoolPageSize;
+
+	//minimum allocation unit
+	private short bufferPoolChunkSize;
+	
+	// buffer pool page number 
+	private short bufferPoolPageNumber;
+
 	private int defaultMaxLimit = DEFAULT_MAX_LIMIT;
 	public static final int SEQUENCEHANDLER_LOCALFILE = 0;
 	public static final int SEQUENCEHANDLER_MYSQLDB = 1;
 	public static final int SEQUENCEHANDLER_LOCAL_TIME = 2;
 	public static final int SEQUENCEHANDLER_ZK_DISTRIBUTED = 3;
 	public static final int SEQUENCEHANDLER_ZK_GLOBAL_INCREMENT = 4;
+	/*
+	 * 注意！！！ 目前mycat支持的MySQL版本，如果后续有新的MySQL版本,请添加到此数组， 对于MySQL的其他分支，
+	 * 比如MariaDB目前版本号已经到10.1.x，但是其驱动程序仍然兼容官方的MySQL,因此这里版本号只需要MySQL官方的版本号即可。
+	 */
+	public static final String[] MySQLVersions = { "5.5", "5.6", "5.7" };
 	private int sequnceHandlerType = SEQUENCEHANDLER_LOCALFILE;
 	private String sqlInterceptor = "io.mycat.server.interceptor.impl.DefaultSqlInterceptor";
 	private String sqlInterceptorType = "select";
@@ -123,6 +139,14 @@ public final class SystemConfig {
 	private long checkTableConsistencyPeriod = CHECKTABLECONSISTENCYPERIOD;
 	private final static long CHECKTABLECONSISTENCYPERIOD = 1 * 60 * 1000;
 
+	private int processorBufferPoolType = 0;
+
+	// 全局表一致性检测任务，默认24小时调度一次
+	private static final long DEFAULT_GLOBAL_TABLE_CHECK_PERIOD = 24 * 60 * 60 * 1000L;
+	private int useGlobleTableCheck = 1;	// 全局表一致性检查开关
+	
+	private long glableTableCheckPeriod;
+	
 	public boolean isEnableDistributedTransactions() {
 		return enableDistributedTransactions;
 	}
@@ -146,10 +170,13 @@ public final class SystemConfig {
 		this.managerPort = DEFAULT_MANAGER_PORT;
 		this.charset = DEFAULT_CHARSET;
 		this.processors = DEFAULT_PROCESSORS;
-		this.processorBufferChunk = DEFAULT_BUFFER_CHUNK_SIZE;
+		this.bufferPoolPageSize = DEFAULT_BUFFER_POOL_PAGE_SIZE;
+		this.bufferPoolChunkSize = DEFAULT_BUFFER_CHUNK_SIZE;
+		this.bufferPoolPageNumber = (short) (DEFAULT_PROCESSORS*2);
+
 		this.processorExecutor = (DEFAULT_PROCESSORS != 1) ? DEFAULT_PROCESSORS * 2 : 4;
 		this.managerExecutor = 2;
-		this.processorBufferPool = DEFAULT_BUFFER_CHUNK_SIZE * processors * 1000;
+
 		this.processorBufferLocalPercent = 100;
 		this.timerExecutor = 2;
 		this.idleTimeout = DEFAULT_IDLE_TIMEOUT;
@@ -164,7 +191,23 @@ public final class SystemConfig {
 		this.txIsolation = Isolations.REPEATED_READ;
 		this.parserCommentVersion = DEFAULT_PARSER_COMMENT_VERSION;
 		this.sqlRecordCount = DEFAULT_SQL_RECORD_COUNT;
+		this.glableTableCheckPeriod = DEFAULT_GLOBAL_TABLE_CHECK_PERIOD;
+	}
 
+	public int getUseGlobleTableCheck() {
+		return useGlobleTableCheck;
+	}
+
+	public void setUseGlobleTableCheck(int useGlobleTableCheck) {
+		this.useGlobleTableCheck = useGlobleTableCheck;
+	}
+
+	public long getGlableTableCheckPeriod() {
+		return glableTableCheckPeriod;
+	}
+
+	public void setGlableTableCheckPeriod(long glableTableCheckPeriod) {
+		this.glableTableCheckPeriod = glableTableCheckPeriod;
 	}
 
 	public String getSqlInterceptor() {
@@ -293,6 +336,14 @@ public final class SystemConfig {
 
 	public void setCharset(String charset) {
 		this.charset = charset;
+	}
+
+	public String getFakeMySQLVersion() {
+		return fakeMySQLVersion;
+	}
+
+	public void setFakeMySQLVersion(String mysqlVersion) {
+		this.fakeMySQLVersion = mysqlVersion;
 	}
 
 	public int getServerPort() {
@@ -463,20 +514,29 @@ public final class SystemConfig {
 		this.sqlRecordCount = sqlRecordCount;
 	}
 
-	public long getProcessorBufferPool() {
-		return processorBufferPool;
+
+	public short getBufferPoolChunkSize() {
+		return bufferPoolChunkSize;
 	}
 
-	public void setProcessorBufferPool(long processorBufferPool) {
-		this.processorBufferPool = processorBufferPool;
+	public void setBufferPoolChunkSize(short bufferPoolChunkSize) {
+		this.bufferPoolChunkSize = bufferPoolChunkSize;
 	}
 
-	public int getProcessorBufferChunk() {
-		return processorBufferChunk;
+	public int getBufferPoolPageSize() {
+		return bufferPoolPageSize;
 	}
 
-	public void setProcessorBufferChunk(int processorBufferChunk) {
-		this.processorBufferChunk = processorBufferChunk;
+	public void setBufferPoolPageSize(int bufferPoolPageSize) {
+		this.bufferPoolPageSize = bufferPoolPageSize;
+	}
+
+	public short getBufferPoolPageNumber() {
+		return bufferPoolPageNumber;
+	}
+
+	public void setBufferPoolPageNumber(short bufferPoolPageNumber) {
+		this.bufferPoolPageNumber = bufferPoolPageNumber;
 	}
 
 	public int getFrontSocketSoRcvbuf() {
@@ -620,8 +680,9 @@ public final class SystemConfig {
 				+ ", clusterHeartbeatRetry=" + clusterHeartbeatRetry
 				+ ", txIsolation=" + txIsolation + ", parserCommentVersion="
 				+ parserCommentVersion + ", sqlRecordCount=" + sqlRecordCount
-				+ ", processorBufferPool=" + processorBufferPool
-				+ ", processorBufferChunk=" + processorBufferChunk
+				+ ", bufferPoolPageSize=" + bufferPoolPageSize
+				+ ", bufferPoolChunkSize=" + bufferPoolChunkSize
+				+ ", bufferPoolPageNumber=" + bufferPoolPageNumber
 				+ ", defaultMaxLimit=" + defaultMaxLimit
 				+ ", sequnceHandlerType=" + sequnceHandlerType
 				+ ", sqlInterceptor=" + sqlInterceptor
@@ -651,5 +712,13 @@ public final class SystemConfig {
 
 	public void setCheckTableConsistencyPeriod(long checkTableConsistencyPeriod) {
 		this.checkTableConsistencyPeriod = checkTableConsistencyPeriod;
+	}
+
+	public int getProcessorBufferPoolType() {
+		return processorBufferPoolType;
+	}
+
+	public void setProcessorBufferPoolType(int processorBufferPoolType) {
+		this.processorBufferPoolType = processorBufferPoolType;
 	}
 }

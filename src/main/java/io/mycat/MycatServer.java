@@ -37,10 +37,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+import io.mycat.buffer.BufferPool;
+import io.mycat.buffer.ByteBufferArena;
 import io.mycat.config.model.SchemaConfig;
 import io.mycat.config.model.TableConfig;
 import io.mycat.config.table.structure.MySQLTableStructureDetector;
+import io.mycat.route.factory.RouteStrategyFactory;
 import io.mycat.sqlengine.SQLJob;
+import io.mycat.statistic.stat.UserStat;
+import io.mycat.statistic.stat.UserStatAnalyzer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,7 +53,7 @@ import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
 
 import io.mycat.backend.datasource.PhysicalDBPool;
-import io.mycat.buffer.BufferPool;
+import io.mycat.buffer.DirectByteBufferPool;
 import io.mycat.cache.CacheService;
 import io.mycat.config.MycatConfig;
 import io.mycat.config.classloader.DynaClassLoader;
@@ -66,6 +71,7 @@ import io.mycat.route.MyCATSequnceProcessor;
 import io.mycat.route.RouteService;
 import io.mycat.server.ServerConnectionFactory;
 import io.mycat.server.interceptor.SQLInterceptor;
+import io.mycat.server.interceptor.impl.GlobalTableUtil;
 import io.mycat.statistic.SQLRecorder;
 import io.mycat.util.ExecutorUtil;
 import io.mycat.util.NameableExecutor;
@@ -78,6 +84,7 @@ public class MycatServer {
 	public static final String NAME = "MyCat";
 	private static final long LOG_WATCH_DELAY = 60000L;
 	private static final long TIME_UPDATE_PERIOD = 20L;
+	private static final long DEFAULT_SQL_STAT_RECYCLE_PERIOD = 5*1000L;
 	private static final MycatServer INSTANCE = new MycatServer();
 	private static final Logger LOGGER = LoggerFactory.getLogger("MycatServer");
 	private final RouteService routerService;
@@ -92,6 +99,7 @@ public class MycatServer {
 	private final DynaClassLoader catletClassLoader;
 	private final SQLInterceptor sqlInterceptor;
 	private volatile int nextProcessor;
+	// System Buffer Pool Instance
 	private BufferPool bufferPool;
 	private boolean aio = false;
 
@@ -226,11 +234,13 @@ public class MycatServer {
 				+ system.getProcessors() + ",aio thread pool size:"
 				+ system.getProcessorExecutor()
 				+ "    \r\n each process allocated socket buffer pool "
-				+ " bytes ,buffer chunk size:"
-				+ system.getProcessorBufferChunk()
-				+ "  buffer pool's capacity(buferPool/bufferChunk) is:"
-				+ system.getProcessorBufferPool()
-				/ system.getProcessorBufferChunk();
+				+ " bytes ,a page size:"
+				+ system.getBufferPoolPageSize()
+				+ "  a page's chunk number(PageSize/ChunkSize) is:"
+				+ (system.getBufferPoolPageSize()
+				  /system.getBufferPoolChunkSize())
+				+ "  buffer page's number is:"
+				+ system.getBufferPoolPageNumber();
 		LOGGER.info(inf);
 		LOGGER.info("sysconfig params:" + system.toString());
 
@@ -244,11 +254,36 @@ public class MycatServer {
 		// startup processors
 		int threadPoolSize = system.getProcessorExecutor();
 		processors = new NIOProcessor[processorCount];
-		long processBuferPool = system.getProcessorBufferPool();
-		int processBufferChunk = system.getProcessorBufferChunk();
+		// a page size
+		int bufferPoolPageSize = system.getBufferPoolPageSize();
+		// total page number 
+		short bufferPoolPageNumber = system.getBufferPoolPageNumber();
+		//minimum allocation unit
+		short bufferPoolChunkSize = system.getBufferPoolChunkSize();
+		
 		int socketBufferLocalPercent = system.getProcessorBufferLocalPercent();
-		bufferPool = new BufferPool(processBuferPool, processBufferChunk, system.getFrontSocketSoRcvbuf(),
-				socketBufferLocalPercent / processorCount);
+		int bufferPoolType = system.getProcessorBufferPoolType();
+		switch (bufferPoolType){
+			case 0:
+				bufferPool = new DirectByteBufferPool(bufferPoolPageSize,bufferPoolChunkSize,
+					bufferPoolPageNumber,system.getFrontSocketSoRcvbuf());
+				break;
+			case 1:
+				/**
+				 * todo 对应权威指南修改：
+				 *
+				 * bytebufferarena由6个bytebufferlist组成，这六个list有减少内存碎片的机制
+				 * 每个bytebufferlist由多个bytebufferchunk组成，每个list也有减少内存碎片的机制
+				 * 每个bytebufferchunk由多个page组成，平衡二叉树管理内存使用状态，计算灵活
+				 * 设置的pagesize对应bytebufferarena里面的每个bytebufferlist的每个bytebufferchunk的buffer长度
+				 * bufferPoolChunkSize对应每个bytebufferchunk的每个page的长度
+				 * bufferPoolPageNumber对应每个bytebufferlist有多少个bytebufferchunk
+				 */
+				bufferPool = new ByteBufferArena(bufferPoolPageSize,bufferPoolChunkSize,bufferPoolPageNumber,system.getFrontSocketSoRcvbuf());
+				break;
+		}
+		bufferPool = new DirectByteBufferPool(bufferPoolPageSize,bufferPoolChunkSize,
+				bufferPoolPageNumber,system.getFrontSocketSoRcvbuf());
 		businessExecutor = ExecutorUtil.create("BusinessExecutor",
 				threadPoolSize);
 		timerExecutor = ExecutorUtil.create("Timer", system.getTimerExecutor());
@@ -273,7 +308,8 @@ public class MycatServer {
 									@Override
 									public Thread newThread(Runnable r) {
 										Thread th = new Thread(r);
-										th.setName(BufferPool.LOCAL_BUF_THREAD_PREX
+										//TODO
+										th.setName(DirectByteBufferPool.LOCAL_BUF_THREAD_PREX
 												+ "AIO" + (inx++));
 										LOGGER.info("created new AIO thread "
 												+ th.getName());
@@ -292,18 +328,19 @@ public class MycatServer {
 
 		} else {
 			LOGGER.info("using nio network handler ");
+			
 			NIOReactorPool reactorPool = new NIOReactorPool(
-					BufferPool.LOCAL_BUF_THREAD_PREX + "NIOREACTOR",
+					DirectByteBufferPool.LOCAL_BUF_THREAD_PREX + "NIOREACTOR",
 					processors.length);
-			connector = new NIOConnector(BufferPool.LOCAL_BUF_THREAD_PREX
+			connector = new NIOConnector(DirectByteBufferPool.LOCAL_BUF_THREAD_PREX
 					+ "NIOConnector", reactorPool);
 			((NIOConnector) connector).start();
 
-			manager = new NIOAcceptor(BufferPool.LOCAL_BUF_THREAD_PREX + NAME
+			manager = new NIOAcceptor(DirectByteBufferPool.LOCAL_BUF_THREAD_PREX + NAME
 					+ "Manager", system.getBindIp(), system.getManagerPort(),
 					mf, reactorPool);
 
-			server = new NIOAcceptor(BufferPool.LOCAL_BUF_THREAD_PREX + NAME
+			server = new NIOAcceptor(DirectByteBufferPool.LOCAL_BUF_THREAD_PREX + NAME
 					+ "Server", system.getBindIp(), system.getServerPort(), sf,
 					reactorPool);
 		}
@@ -342,6 +379,14 @@ public class MycatServer {
         if(system.getCheckTableConsistency()==1) {
             scheduler.scheduleAtFixedRate(tableStructureCheck(), 0L, system.getCheckTableConsistencyPeriod(), TimeUnit.MILLISECONDS);
         }
+		if(system.getUseSqlStat()==1) {
+			scheduler.scheduleAtFixedRate(recycleSqlStat(), 0L, DEFAULT_SQL_STAT_RECYCLE_PERIOD, TimeUnit.MILLISECONDS);
+		}
+		if(system.getUseGlobleTableCheck() == 1){	// 全局表一致性检测是否开启
+			scheduler.scheduleAtFixedRate(glableTableConsistencyCheck(), 0L, system.getGlableTableCheckPeriod(), TimeUnit.MILLISECONDS);
+		}
+		
+		RouteStrategyFactory.init();
 //        new Thread(tableStructureCheck()).start();
 	}
 
@@ -564,8 +609,40 @@ public class MycatServer {
 		};
 	}
 
+	//定时清理保存SqlStat中的数据
+	private Runnable recycleSqlStat(){
+		return new Runnable() {
+			@Override
+			public void run() {
+				Map<String, UserStat> statMap = UserStatAnalyzer.getInstance().getUserStatMap();
+				for (UserStat userStat : statMap.values()) {
+					userStat.getSqlLastStat().recycle();
+					userStat.getSqlRecorder().recycle();
+					userStat.getSqlHigh().recycle();
+					userStat.getSqlLargeRowStat().recycle();
+				}
+			}
+		};
+	}
+
+	//定时检查不同分片表结构一致性
 	private Runnable tableStructureCheck(){
 		return new MySQLTableStructureDetector();
+	}
+	
+	//  全局表一致性检查任务
+	private Runnable glableTableConsistencyCheck() {
+		return new Runnable() {
+			@Override
+			public void run() {
+				timerExecutor.execute(new Runnable() {
+					@Override
+					public void run() {
+						GlobalTableUtil.consistencyCheck();
+					}
+				});
+			}
+		};
 	}
 
 	public boolean isAIO() {

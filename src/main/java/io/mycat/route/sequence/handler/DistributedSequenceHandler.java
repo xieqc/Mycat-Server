@@ -20,18 +20,18 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.HashSet;
+import java.util.Date;
 import java.util.List;
 import java.util.Properties;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 基于ZK与本地配置的分布式ID生成器(可以通过ZK获取集群（机房）唯一InstanceID，也可以通过配置文件配置InstanceID)
  * ID结构：long 64位，ID最大可占63位
- * |current time millis(微秒时间戳38位,可以使用17年)|clusterId（机房或者ZKid，通过配置文件配置4位）|instanceId（实例ID，可以通过ZK或者配置文件获取，4位）|threadId（线程ID，9位）|increment(自增,8位)
- * 一共63位，可以承受单机房单机器单线程1000*(2^8)=2560000的并发。
+ * |current time millis(微秒时间戳38位,可以使用17年)|clusterId（机房或者ZKid，通过配置文件配置5位）|instanceId（实例ID，可以通过ZK或者配置文件获取，5位）|threadId（线程ID，9位）|increment(自增,6位)
+ * 一共63位，可以承受单机房单机器单线程1000*(2^6)=640000的并发。
  * 无悲观锁，无强竞争，吞吐量更高
  * <p/>
  * 配置文件：sequence_distributed_conf.properties
@@ -54,12 +54,12 @@ public class DistributedSequenceHandler extends LeaderSelectorListenerAdapter im
     }
 
     private final long timestampBits = 38L;
-    private final long clusterIdBits = 4L;
-    private final long instanceIdBits = 4L;
+    private final long clusterIdBits = 5L;
+    private final long instanceIdBits = 5L;
     private final long threadIdBits = 9L;
-    private final long incrementBits = 8L;
+    private final long incrementBits = 6L;
 
-    private final long timestampMask = (1L << timestampBits) - 1L ;
+    private final long timestampMask = (1L << timestampBits) - 1L;
 
     private final long incrementShift = 0L;
     private final long threadIdShift = incrementShift + incrementBits;
@@ -120,7 +120,10 @@ public class DistributedSequenceHandler extends LeaderSelectorListenerAdapter im
         this.leaderSelector = leaderSelector;
     }
 
-    private ConcurrentMap<Thread, Integer> threadInc = new ConcurrentHashMap<Thread, Integer>((int) maxIncrement);
+    private ThreadLocal<Long> threadInc = new ThreadLocal<>();
+    private ThreadLocal<Long> threadLastTime = new ThreadLocal<>();
+    private ThreadLocal<Long> threadID = new ThreadLocal<>();
+    private long nextID = 0L;
 
     public DistributedSequenceHandler(SystemConfig mycatConfig) {
         this.mycatConfig = mycatConfig;
@@ -141,13 +144,16 @@ public class DistributedSequenceHandler extends LeaderSelectorListenerAdapter im
 
     }
 
+    private final ScheduledExecutorService timerExecutor = Executors.newSingleThreadScheduledExecutor();
+    private final long SELF_CHECK_PERIOD = 10L;
+
     public void initializeZK(String zkAddress) {
         this.client = CuratorFrameworkFactory.newClient(zkAddress, new ExponentialBackoffRetry(1000, 3));
         this.client.start();
         this.leaderSelector = new LeaderSelector(client, PATH + "/leader", this);
         this.leaderSelector.autoRequeue();
         this.leaderSelector.start();
-        new Thread() {
+        this.timerExecutor.scheduleAtFixedRate( new Runnable() {
             @Override
             public void run() {
                 while (!leaderExists()) {
@@ -157,28 +163,28 @@ public class DistributedSequenceHandler extends LeaderSelectorListenerAdapter im
                         LOGGER.warn("Unexpected thread interruption!");
                     }
                 }
-                while (true) {
+//                while (true) {
                     if (isLeader) {
-                        continue;
+                        return;
                     }
                     while (!tryGetInstanceID()) ;
                     //心跳，需要考虑网络不通畅时，别人抢占了自己的节点，需要重新获取
-                    while (true) {
-                        try {
-                            if (isLeader) break;
-                            byte[] data = client.getData().forPath(PATH + "/instance/" + instanceId);
-                            if (data == null || !new String(data).equals(ID)) {
-                                while (!tryGetInstanceID()) ;
-                            }
-                            //每隔10秒一次心跳
-                            Thread.sleep(10000);
-                        } catch (Exception e) {
-                            LOGGER.warn("Exception caught:" + e.getCause());
+
+                    try {
+                        if (isLeader)
+                            return;
+                        byte[] data = client.getData().forPath(PATH + "/instance/" + instanceId);
+                        if (data == null || !new String(data).equals(ID)) {
+                            while (!tryGetInstanceID()) ;
+                        } else{
+                            return;
                         }
+                    } catch (Exception e) {
+                        LOGGER.warn("Exception caught:" + e.getCause());
                     }
-                }
+//                }
             }
-        }.start();
+        },0L,SELF_CHECK_PERIOD,TimeUnit.SECONDS);
     }
 
     private boolean tryGetInstanceID() {
@@ -220,8 +226,6 @@ public class DistributedSequenceHandler extends LeaderSelectorListenerAdapter im
         }
     }
 
-    private Set<Long> isSet = new HashSet<>();
-
     @Override
     public long nextId(String prefixName) {
         while (!ready) {
@@ -231,19 +235,38 @@ public class DistributedSequenceHandler extends LeaderSelectorListenerAdapter im
                 LOGGER.warn("Unexpected thread interruption!");
             }
         }
-        final Thread thread = Thread.currentThread();
-        if (threadInc.get(thread) == null) {
-            threadInc.put(thread, 0);
-        } else {
-            int a = threadInc.get(thread);
-            if (a >= maxIncrement) {
-                threadInc.put(thread, 0);
-            } else {
-                threadInc.put(thread, a + 1);
-            }
+        long time = System.currentTimeMillis();
+        if (threadLastTime.get() == null) {
+            threadLastTime.set(time);
         }
-        int a = threadInc.get(thread);
-        return ((System.currentTimeMillis() & timestampMask) << timestampShift) | (((thread.getId() % maxThreadId) << threadIdShift)) | (instanceId << instanceIdShift) | (clusterId << clusterIdShift) | a;
+        if (threadInc.get() == null) {
+            threadInc.set(0L);
+        }
+        if (threadID.get() == null) {
+            threadID.set(getNextThreadID());
+        }
+        long a = threadInc.get();
+        if ((a + 1L) >= maxIncrement) {
+            if (threadLastTime.get() == time) {
+                time = blockUntilNextMillis(time);
+            }
+            threadInc.set(0L);
+        } else {
+            threadInc.set(a + 1L);
+        }
+        threadLastTime.set(time);
+        return ((time & timestampMask) << timestampShift) | (((threadID.get() % maxThreadId) << threadIdShift)) | (instanceId << instanceIdShift) | (clusterId << clusterIdShift) | a;
+    }
+
+    private synchronized Long getNextThreadID() {
+        long i = nextID;
+        nextID++;
+        return i;
+    }
+
+    private long blockUntilNextMillis(long time) {
+        while (System.currentTimeMillis() == time) ;
+        return System.currentTimeMillis();
     }
 
     @Override
@@ -334,6 +357,6 @@ public class DistributedSequenceHandler extends LeaderSelectorListenerAdapter im
 
     public static void main(String[] args) throws InterruptedException {
         System.out.println((1L << 38L) - 1L);
-
+        System.out.println(new Date(System.currentTimeMillis() + (1L << 39L) - 1L));
     }
 }
